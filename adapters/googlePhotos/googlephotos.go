@@ -113,9 +113,10 @@ func borrowable(j, f fileKey, seriesPerName map[string]int) bool {
 	return seriesPerName[j.base] == 1 && seriesPerName[f.base] == 1
 }
 
-// holdsSameFile tells whether the directory dir already holds a file with the name, the size and the content of af.
-// Contents are read only for files of the same name and size, and kept on the files so that each is read once.
-func (cat directoryCatalog) holdsSameFile(dir string, af *assetFile) bool {
+// holdsIdenticalFile tells whether the directory dir already holds a file with the name, the size and the content
+// of af. Contents are read only for files of the same name and size, and kept on the files so that each is read once.
+// A file that can't be read is identical to none: it is kept, which is the safe side.
+func (cat directoryCatalog) holdsIdenticalFile(dir string, af *assetFile) bool {
 	sum := func(f *assetFile) []byte { // nil if the file can't be read, then tried again next time
 		if f.sum == nil {
 			f.sum, _ = hash.FileSHA1Hash(f.fsys, path.Join(dir, f.base))
@@ -134,8 +135,8 @@ func (cat directoryCatalog) holdsSameFile(dir string, af *assetFile) bool {
 	return false
 }
 
-// spansSeries tells whether the directory holds files or sidecars of more than one series.
-func (cat directoryCatalog) spansSeries() bool {
+// holdsSeveralSeries tells whether the directory holds files or sidecars of more than one series.
+func (cat directoryCatalog) holdsSeveralSeries() bool {
 	series := map[string]bool{}
 	for k := range cat.jsons {
 		series[k.series] = true
@@ -154,7 +155,7 @@ type assetFile struct {
 	date    time.Time        // file modification date
 	md      *assets.Metadata // will point to the associated metadata
 	matcher string           // name of the matcher that associated the file with its metadata
-	sum     []byte           // SHA1 of the content, read by holdsSameFile when a file of the same name and size shows up
+	sum     []byte           // SHA1 of the content, read by holdsIdenticalFile when a file of the same name and size shows up
 }
 
 // Implement slog.LogValuer for assetFile
@@ -188,6 +189,7 @@ func (toc *TakeoutCmd) Browse(ctx context.Context) chan *assets.Group {
 			cancel(err)
 			return
 		}
+		toc.findNamesakes()
 		err = toc.passTwo(ctx, gOut)
 		cancel(err)
 	}()
@@ -345,7 +347,7 @@ func (toc *TakeoutCmd) passOneFsWalk(ctx context.Context, w fs.FS) error {
 
 				// A file of the same name in this series, or the same file from another series, is a duplicate.
 				// The same name and size alone is not proof: the content is compared.
-				if _, ok := dirCatalog.unMatchedFiles[fileKey{series: series, base: base}]; ok || dirCatalog.holdsSameFile(dir, af) {
+				if _, ok := dirCatalog.unMatchedFiles[fileKey{series: series, base: base}]; ok || dirCatalog.holdsIdenticalFile(dir, af) {
 					toc.processor.RecordAssetDiscardedImmediately(ctx, fshelper.FSName(w, name), finfo.Size(), fileevent.DiscardedLocalDuplicate, "duplicated in the directory")
 					return nil
 				}
@@ -394,6 +396,20 @@ func (toc *TakeoutCmd) passOneFsWalk(ctx context.Context, w fs.FS) error {
 
 type matcherFn func(jsonName string, fileName string, sm filetypes.SupportedMedia) bool
 
+// seriesPass is a round of a matcher over a directory: sidecars of the file's own series first, then, when the
+// directory holds several series, a borrowable sidecar of another series.
+type seriesPass int
+
+const (
+	ownSeries seriesPass = iota
+	otherSeries
+)
+
+// considers tells whether the pass looks at the sidecar j for the file f.
+func (p seriesPass) considers(j, f fileKey) bool {
+	return (j.series == f.series) == (p == ownSeries)
+}
+
 // matchers is a list of matcherFn from the most likely to be used to the least one
 var matchers = []struct {
 	name string
@@ -411,25 +427,24 @@ func (toc *TakeoutCmd) solvePuzzle(ctx context.Context) error {
 	for _, dir := range dirs {
 		cat := toc.catalogs[dir]
 		jsons := sortedFileKeys(cat.jsons)
-		passes := []bool{true}
-		if cat.spansSeries() {
-			passes = append(passes, false)
+		passes := []seriesPass{ownSeries}
+		if cat.holdsSeveralSeries() {
+			passes = append(passes, otherSeries)
 		}
 		seriesPerName := cat.seriesPerName()
 		for _, matcher := range matchers {
-			// sidecars of the file's own series first, then a borrowable sidecar of another series
-			for _, sameSeries := range passes {
+			for _, pass := range passes {
 				for _, json := range jsons {
 					md := cat.jsons[json]
 					for f := range cat.unMatchedFiles {
-						if (json.series == f.series) != sameSeries {
+						if !pass.considers(json, f) {
 							continue
 						}
 						select {
 						case <-ctx.Done():
 							return ctx.Err()
 						default:
-							if matcher.fn(json.base, f.base, toc.supportedMedia) && (sameSeries || borrowable(json, f, seriesPerName)) {
+							if matcher.fn(json.base, f.base, toc.supportedMedia) && (pass == ownSeries || borrowable(json, f, seriesPerName)) {
 								i := cat.unMatchedFiles[f]
 								i.matcher = matcher.name
 								i.md = md
@@ -457,6 +472,31 @@ func (toc *TakeoutCmd) solvePuzzle(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// findNamesakes collects the names and the titles of the files that a directory keeps in several series. They are
+// different files, as pass one dropped the identical ones, and the upload can't tell them apart by name and date.
+// Their copies in other directories (albums) have the same name, or at least the same title.
+func (toc *TakeoutCmd) findNamesakes() {
+	toc.namesakes = map[string]bool{}
+	for _, cat := range toc.catalogs {
+		if len(cat.series) < 2 {
+			continue // one series holds one file per name
+		}
+		byName := map[string][]*assets.Asset{}
+		for k, a := range cat.matchedFiles {
+			byName[k.base] = append(byName[k.base], a)
+		}
+		for base, as := range byName {
+			if len(as) < 2 {
+				continue
+			}
+			toc.namesakes[base] = true
+			for _, a := range as {
+				toc.namesakes[a.OriginalFileName] = true
+			}
+		}
+	}
 }
 
 // Browse return a channel of assets
@@ -487,10 +527,17 @@ func (toc *TakeoutCmd) handleDir(ctx context.Context, dir string, gOut chan *ass
 	catalog := toc.catalogs[dir]
 
 	dirEntries := make([]*assets.Asset, 0, len(catalog.matchedFiles))
+	seriesOf := map[*assets.Asset]string{}
+	namesakeSeries := map[string]bool{} // series of the directory's files with namesakes, before any is dropped
 
 	// Filter and sort the files
 	for _, name := range sortedFileKeys(catalog.matchedFiles) {
 		a := catalog.matchedFiles[name]
+		a.HasNamesake = toc.namesakes[name.base] || toc.namesakes[a.OriginalFileName]
+		seriesOf[a] = groupingSeries(name.series, a)
+		if a.HasNamesake {
+			namesakeSeries[seriesOf[a]] = true
+		}
 		key := fileKeyTracker{baseName: name.base, size: int64(a.FileSize)}
 		track, _ := toc.fileTracker.Load(key) // track := to.fileTracker[key]
 		if track.status == fileevent.ProcessedUploadSuccess {
@@ -506,6 +553,51 @@ func (toc *TakeoutCmd) handleDir(ctx context.Context, dir string, gOut chan *ass
 		dirEntries = append(dirEntries, a)
 	}
 
+	for _, entries := range partitionBySeries(dirEntries, seriesOf, len(namesakeSeries) > 1) {
+		if len(entries) == 0 {
+			continue
+		}
+		if err := toc.sendGroups(ctx, entries, gOut); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// groupingSeries is the series a file is grouped in: that of its sidecar, as an edit or a Live Photo half can take
+// the sidecar of its original in another series, else its own.
+func groupingSeries(own string, a *assets.Asset) string {
+	if md := a.FromApplication; md != nil && md.File.FS() != nil {
+		return takeoutSeries(md.File.FS())
+	}
+	return own
+}
+
+// partitionBySeries splits the files of a directory for grouping. When the directory holds namesakes (#1473) of
+// several series (split), different photos of one name, its files are grouped series by series: no group, hence no
+// stack, mixes two photos, and every grouper keeps a file with its own companions (edited copy, RAW, Live Photo half,
+// scan copies, burst frames), which share its sidecar's series in real exports. Any other directory is grouped as a
+// whole, as before.
+func partitionBySeries(entries []*assets.Asset, seriesOf map[*assets.Asset]string, split bool) [][]*assets.Asset {
+	if !split {
+		return [][]*assets.Asset{entries}
+	}
+	bySeries := map[string][]*assets.Asset{}
+	for _, a := range entries {
+		bySeries[seriesOf[a]] = append(bySeries[seriesOf[a]], a)
+	}
+	parts := make([][]*assets.Asset, 0, len(bySeries))
+	for _, s := range gen.MapKeysSorted(bySeries) {
+		parts = append(parts, bySeries[s])
+	}
+	return parts
+}
+
+// sendGroups groups the files of a directory and sends the groups to gOut.
+func (toc *TakeoutCmd) sendGroups(ctx context.Context, dirEntries []*assets.Asset, gOut chan *assets.Group) error {
 	// the go routine push all asset to the in chanel for been grouped
 	in := make(chan *assets.Asset)
 	go func() {

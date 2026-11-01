@@ -7,8 +7,10 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -24,6 +26,8 @@ import (
 	"github.com/simulot/immich-go/internal/fshelper"
 	"github.com/simulot/immich-go/internal/gen"
 	"github.com/simulot/immich-go/internal/groups"
+	"github.com/simulot/immich-go/internal/groups/burst"
+	"github.com/simulot/immich-go/internal/groups/epsonfastfoto"
 	"github.com/simulot/immich-go/internal/groups/series"
 	"github.com/spf13/cobra"
 )
@@ -138,6 +142,20 @@ func writeZip(t *testing.T, dir, name string, files map[string][]byte) {
 	}
 }
 
+// writeDir writes a takeout part extracted into the folder dir/name.
+func writeDir(t *testing.T, dir, name string, files map[string][]byte) {
+	t.Helper()
+	for n, b := range files {
+		p := filepath.Join(dir, name, filepath.FromSlash(n))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // Two different photos with the same path in two series of real zip parts, opened
 // the way the command opens them, are both imported, each with the date from the
 // sidecar of its own series.
@@ -170,6 +188,360 @@ func TestSamePathInTwoSeriesOfRealZips(t *testing.T) {
 	}
 	if got := dateOf(t, all, 200); !got.Equal(takenS2) {
 		t.Errorf("series-2 photo: date %v, want %v from its own sidecar", got, takenS2)
+	}
+}
+
+// The same with the parts extracted into folders named after their zips (as Windows
+// does) and each passed as an argument: the folder name gives the series.
+func TestSamePathInTwoSeriesOfExtractedPartFolders(t *testing.T) {
+	takenS1 := time.Date(2025, 1, 2, 10, 0, 0, 0, time.UTC)
+	takenS2 := time.Date(2025, 8, 20, 18, 30, 0, 0, time.UTC)
+	dir := t.TempDir()
+	writeDir(t, dir, "takeout-20251016T092000Z-1-001", map[string][]byte{
+		collisionDir + "/IMG_0001(1).jpg":                            []byte(strings.Repeat("a", 100)),
+		collisionDir + "/IMG_0001.jpg.supplemental-metadata(1).json": sidecarJSON("IMG_0001.jpg", takenS1),
+	})
+	writeDir(t, dir, "takeout-20251016T092000Z-2-001", map[string][]byte{
+		collisionDir + "/IMG_0001(1).jpg":                            []byte(strings.Repeat("b", 200)),
+		collisionDir + "/IMG_0001.jpg.supplemental-metadata(1).json": sidecarJSON("IMG_0001.jpg", takenS2),
+	})
+	parts, err := fshelper.ParsePath([]string{
+		filepath.Join(dir, "takeout-20251016T092000Z-1-001"),
+		filepath.Join(dir, "takeout-20251016T092000Z-2-001"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fshelper.CloseFSs(parts) })
+	toc, rec := newCollisionTakeoutCmd(t, parts...)
+
+	all := browseAll(t, toc)
+
+	if n := rec.GetCounts()[fileevent.DiscardedLocalDuplicate]; n != 0 {
+		t.Errorf("%d file(s) discarded as local duplicates, want 0: the two files differ", n)
+	}
+	if got := dateOf(t, all, 100); !got.Equal(takenS1) {
+		t.Errorf("series-1 photo: date %v, want %v from its own sidecar", got, takenS1)
+	}
+	if got := dateOf(t, all, 200); !got.Equal(takenS2) {
+		t.Errorf("series-2 photo: date %v, want %v from its own sidecar", got, takenS2)
+	}
+}
+
+// Two different files kept under one name are marked, so that the upload compares them
+// with the server by checksum only: name, date and size cannot tell them apart from
+// versions of one photo. Other files are not marked.
+func TestFilesOfTheSameNameInTwoSeriesAreMarkedAsNamesakes(t *testing.T) {
+	taken := time.Date(2025, 3, 26, 11, 26, 52, 0, time.UTC)
+	s1 := namedMapFS{name: "takeout-20251016T092000Z-1-001", MapFS: fstest.MapFS{
+		collisionDir + "/IMG_3285.MOV":                            {Data: []byte(strings.Repeat("a", 100))},
+		collisionDir + "/IMG_3285.MOV.supplemental-metadata.json": {Data: sidecarJSON("IMG_3285.MOV", taken)},
+		collisionDir + "/IMG_3286.MOV":                            {Data: []byte(strings.Repeat("c", 300))},
+		collisionDir + "/IMG_3286.MOV.supplemental-metadata.json": {Data: sidecarJSON("IMG_3286.MOV", taken)},
+	}}
+	s2 := namedMapFS{name: "takeout-20251016T092000Z-2-001", MapFS: fstest.MapFS{
+		collisionDir + "/IMG_3285.MOV":                            {Data: []byte(strings.Repeat("b", 200))},
+		collisionDir + "/IMG_3285.MOV.supplemental-metadata.json": {Data: sidecarJSON("IMG_3285.MOV", taken)},
+	}}
+	toc, _ := newCollisionTakeoutCmd(t, s1, s2)
+
+	all := browseAll(t, toc)
+
+	for _, c := range []struct {
+		size int
+		want bool
+	}{{100, true}, {200, true}, {300, false}} {
+		as := bySize(all, c.size)
+		if len(as) != 1 {
+			t.Fatalf("%d-byte file: got %d assets, want 1", c.size, len(as))
+		}
+		if as[0].HasNamesake != c.want {
+			t.Errorf("%d-byte file: HasNamesake %v, want %v", c.size, as[0].HasNamesake, c.want)
+		}
+	}
+}
+
+// Album folders hold copies of the files of the year folders. The copy of a namesake is
+// marked too: when the album folder comes first, the copy is the one uploaded.
+func TestAlbumCopyOfANamesakeIsMarked(t *testing.T) {
+	taken := time.Date(2025, 3, 26, 11, 26, 52, 0, time.UTC)
+	album := "Takeout/Google Photos/Album X"
+	s1 := namedMapFS{name: "takeout-20251016T092000Z-1-001", MapFS: fstest.MapFS{
+		collisionDir + "/IMG_3285.MOV":                            {Data: []byte(strings.Repeat("a", 100))},
+		collisionDir + "/IMG_3285.MOV.supplemental-metadata.json": {Data: sidecarJSON("IMG_3285.MOV", taken)},
+	}}
+	s2 := namedMapFS{name: "takeout-20251016T092000Z-2-001", MapFS: fstest.MapFS{
+		collisionDir + "/IMG_3285.MOV":                            {Data: []byte(strings.Repeat("b", 200))},
+		collisionDir + "/IMG_3285.MOV.supplemental-metadata.json": {Data: sidecarJSON("IMG_3285.MOV", taken)},
+		album + "/IMG_3285.MOV":                                   {Data: []byte(strings.Repeat("b", 200))},
+		album + "/IMG_3285.MOV.supplemental-metadata.json":        {Data: sidecarJSON("IMG_3285.MOV", taken)},
+		album + "/IMG_4000.MOV":                                   {Data: []byte(strings.Repeat("c", 300))},
+		album + "/IMG_4000.MOV.supplemental-metadata.json":        {Data: sidecarJSON("IMG_4000.MOV", taken)},
+		album + "/metadata.json":                                  {Data: []byte(`{"title": "Album X"}`)},
+	}}
+	toc, _ := newCollisionTakeoutCmd(t, s1, s2)
+
+	all := browseAll(t, toc)
+
+	for _, a := range all {
+		if want := a.FileSize != 300; a.HasNamesake != want {
+			t.Errorf("%s: HasNamesake %v, want %v", a.File.Name(), a.HasNamesake, want)
+		}
+	}
+	// the album folder sorts first: its copy is emitted, the year folder's is a local duplicate
+	b := bySize(all, 200)
+	if len(b) != 1 || b[0].File.Name() != album+"/IMG_3285.MOV" {
+		t.Errorf("series-2 file: got %d assets, want 1, the album's copy", len(b))
+	}
+}
+
+// The upload compares files by their title, the name in the sidecar. A file titled like a
+// namesake is marked as well: here IMG_0001.jpg, as the title of the two different
+// IMG_0001(1).jpg, can be taken by name and date for one of them.
+func TestFileTitledLikeANamesakeIsMarked(t *testing.T) {
+	taken := time.Date(2025, 3, 26, 11, 26, 52, 0, time.UTC)
+	s1 := namedMapFS{name: "takeout-20251016T092000Z-1-001", MapFS: fstest.MapFS{
+		collisionDir + "/IMG_0001.jpg":                               {Data: []byte(strings.Repeat("a", 100))},
+		collisionDir + "/IMG_0001.jpg.supplemental-metadata.json":    {Data: sidecarJSON("IMG_0001.jpg", taken)},
+		collisionDir + "/IMG_0001(1).jpg":                            {Data: []byte(strings.Repeat("c", 300))},
+		collisionDir + "/IMG_0001.jpg.supplemental-metadata(1).json": {Data: sidecarJSON("IMG_0001.jpg", taken.Add(3*time.Second))},
+		collisionDir + "/IMG_0002.jpg":                               {Data: []byte(strings.Repeat("e", 500))},
+		collisionDir + "/IMG_0002.jpg.supplemental-metadata.json":    {Data: sidecarJSON("IMG_0002.jpg", taken)},
+	}}
+	s2 := namedMapFS{name: "takeout-20251016T092000Z-2-001", MapFS: fstest.MapFS{
+		collisionDir + "/IMG_0001(1).jpg":                            {Data: []byte(strings.Repeat("d", 400))},
+		collisionDir + "/IMG_0001.jpg.supplemental-metadata(1).json": {Data: sidecarJSON("IMG_0001.jpg", taken.Add(4*time.Second))},
+	}}
+	toc, _ := newCollisionTakeoutCmd(t, s1, s2)
+
+	all := browseAll(t, toc)
+
+	for _, c := range []struct {
+		size int
+		want bool
+	}{{100, true}, {300, true}, {400, true}, {500, false}} {
+		as := bySize(all, c.size)
+		if len(as) != 1 {
+			t.Fatalf("%d-byte file: got %d assets, want 1", c.size, len(as))
+		}
+		if as[0].HasNamesake != c.want {
+			t.Errorf("%d-byte file: HasNamesake %v, want %v", c.size, as[0].HasNamesake, c.want)
+		}
+	}
+}
+
+// Two different photos of one name and one capture date, one per series, are not one
+// series group: they would be stacked, one hidden under the other.
+func TestNamesakeImagesOfOneDateAreNotOneGroup(t *testing.T) {
+	taken := time.Date(2025, 3, 26, 11, 26, 52, 0, time.UTC)
+	part := func(name string, content byte, size int) namedMapFS {
+		return namedMapFS{name: name, MapFS: fstest.MapFS{
+			collisionDir + "/IMG_0001.jpg":                            {Data: []byte(strings.Repeat(string(content), size))},
+			collisionDir + "/IMG_0001.jpg.supplemental-metadata.json": {Data: sidecarJSON("IMG_0001.jpg", taken)},
+		}}
+	}
+	toc, _ := newCollisionTakeoutCmd(t,
+		part("takeout-20251016T092000Z-1-001", 'a', 400),
+		part("takeout-20251016T092000Z-2-001", 'b', 500))
+
+	gs := browseGroups(t, toc)
+
+	n := 0
+	for _, g := range gs {
+		n += len(g.Assets)
+		if len(g.Assets) > 1 {
+			t.Errorf("the two photos are in one group of %d", len(g.Assets))
+		}
+	}
+	if n != 2 {
+		t.Errorf("got %d assets, want 2", n)
+	}
+}
+
+// partOf names the takeout part an asset comes from.
+func partOf(a *assets.Asset) string {
+	return a.File.FS().(namedMapFS).name
+}
+
+// assertNoGroupMixesParts fails when a group holds files of two parts: with namesakes, two
+// different photos would be stacked as one.
+func assertNoGroupMixesParts(t *testing.T, gs []*assets.Group) {
+	t.Helper()
+	for _, g := range gs {
+		for _, a := range g.Assets[1:] {
+			if partOf(a) != partOf(g.Assets[0]) {
+				t.Errorf("a group of %d mixes %s and %s", len(g.Assets), partOf(g.Assets[0]), partOf(a))
+				break
+			}
+		}
+	}
+}
+
+// groupOf returns the sizes of the files in the group that holds the file of the given size.
+func groupOf(gs []*assets.Group, size int) []int {
+	for _, g := range gs {
+		if len(bySize(g.Assets, size)) > 0 {
+			sizes := []int{}
+			for _, a := range g.Assets {
+				sizes = append(sizes, a.FileSize)
+			}
+			slices.Sort(sizes)
+			return sizes
+		}
+	}
+	return nil
+}
+
+// The companions of a namesake (its edited copy, its RAW) stay with it, in its own series.
+func TestCompanionsOfNamesakesAreGroupedInTheirOwnSeries(t *testing.T) {
+	taken := time.Date(2025, 3, 26, 11, 26, 52, 0, time.UTC)
+	t.Run("edited copy", func(t *testing.T) {
+		s1 := namedMapFS{name: "takeout-20251016T092000Z-1-001", MapFS: fstest.MapFS{
+			collisionDir + "/IMG_0001.jpg":                            {Data: []byte(strings.Repeat("a", 100))},
+			collisionDir + "/IMG_0001.jpg.supplemental-metadata.json": {Data: sidecarJSON("IMG_0001.jpg", taken)},
+		}}
+		s2 := namedMapFS{name: "takeout-20251016T092000Z-2-001", MapFS: fstest.MapFS{
+			collisionDir + "/IMG_0001.jpg":                            {Data: []byte(strings.Repeat("b", 200))},
+			collisionDir + "/IMG_0001-edited.jpg":                     {Data: []byte(strings.Repeat("e", 250))},
+			collisionDir + "/IMG_0001.jpg.supplemental-metadata.json": {Data: sidecarJSON("IMG_0001.jpg", taken)},
+		}}
+		toc, _ := newCollisionTakeoutCmd(t, s1, s2)
+
+		gs := browseGroups(t, toc)
+
+		assertNoGroupMixesParts(t, gs)
+		if got := groupOf(gs, 250); !slices.Equal(got, []int{200, 250}) {
+			t.Errorf("the edited copy is grouped with %v, want with its original: [200 250]", got)
+		}
+	})
+	t.Run("RAW and JPG", func(t *testing.T) {
+		part := func(name string, raw, jpg int) namedMapFS {
+			return namedMapFS{name: name, MapFS: fstest.MapFS{
+				collisionDir + "/IMG_0001.CR2":                            {Data: []byte(strings.Repeat("r", raw))},
+				collisionDir + "/IMG_0001.CR2.supplemental-metadata.json": {Data: sidecarJSON("IMG_0001.CR2", taken)},
+				collisionDir + "/IMG_0001.JPG":                            {Data: []byte(strings.Repeat("j", jpg))},
+				collisionDir + "/IMG_0001.JPG.supplemental-metadata.json": {Data: sidecarJSON("IMG_0001.JPG", taken)},
+			}}
+		}
+		toc, _ := newCollisionTakeoutCmd(t,
+			part("takeout-20251016T092000Z-1-001", 1000, 100),
+			part("takeout-20251016T092000Z-2-001", 2000, 200))
+
+		gs := browseGroups(t, toc)
+
+		assertNoGroupMixesParts(t, gs)
+		for _, want := range [][]int{{100, 1000}, {200, 2000}} {
+			if got := groupOf(gs, want[1]); !slices.Equal(got, want) {
+				t.Errorf("the %d-byte RAW is grouped with %v, want %v", want[1], got, want)
+			}
+		}
+	})
+}
+
+// The Epson FastFoto grouper groups a scan with its enhanced (_a) and back (_b) copies by
+// name alone, whatever the dates. Two different scans of one name, one per series, each
+// stay with their own copies.
+func TestNamesakeScansKeepTheirOwnEpsonCopies(t *testing.T) {
+	part := func(name string, copyName string, size int, taken time.Time) namedMapFS {
+		return namedMapFS{name: name, MapFS: fstest.MapFS{
+			collisionDir + "/Scan_0001.jpg":                               {Data: []byte(strings.Repeat("s", size))},
+			collisionDir + "/Scan_0001.jpg.supplemental-metadata.json":    {Data: sidecarJSON("Scan_0001.jpg", taken)},
+			collisionDir + "/" + copyName:                                 {Data: []byte(strings.Repeat("c", size+1))},
+			collisionDir + "/" + copyName + ".supplemental-metadata.json": {Data: sidecarJSON(copyName, taken)},
+		}}
+	}
+	toc, _ := newCollisionTakeoutCmd(t,
+		part("takeout-20251016T092000Z-1-001", "Scan_0001_a.jpg", 100, time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)),
+		part("takeout-20251016T092000Z-2-001", "Scan_0001_b.jpg", 200, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)))
+	toc.groupers = []groups.Grouper{epsonfastfoto.Group{}.Group, series.Group} // as with --manage-epson-fastfoto
+
+	gs := browseGroups(t, toc)
+
+	assertNoGroupMixesParts(t, gs)
+	for _, want := range [][]int{{100, 101}, {200, 201}} {
+		if got := groupOf(gs, want[0]); !slices.Equal(got, want) {
+			t.Errorf("the %d-byte scan is grouped with %v, want %v", want[0], got, want)
+		}
+	}
+}
+
+// In a directory split by series, an edit whose sidecar is its original's, in another series
+// (Takeout rarely splits them), is grouped with the original: as siblings, the upload never
+// takes one for a smaller or bigger version of the other.
+func TestEditWithItsOriginalsSidecarInAnotherSeriesStaysWithIt(t *testing.T) {
+	taken := time.Date(2025, 3, 26, 11, 26, 52, 0, time.UTC)
+	other := time.Date(2025, 7, 1, 9, 0, 0, 0, time.UTC)
+	s1 := namedMapFS{name: "takeout-20251016T092000Z-1-001", MapFS: fstest.MapFS{
+		collisionDir + "/IMG_3285.MOV":                            {Data: []byte(strings.Repeat("a", 100))},
+		collisionDir + "/IMG_3285.MOV.supplemental-metadata.json": {Data: sidecarJSON("IMG_3285.MOV", other)},
+		collisionDir + "/X.jpg":                                   {Data: []byte(strings.Repeat("o", 300))},
+		collisionDir + "/X.jpg.supplemental-metadata.json":        {Data: sidecarJSON("X.jpg", taken)},
+	}}
+	s2 := namedMapFS{name: "takeout-20251016T092000Z-2-001", MapFS: fstest.MapFS{
+		collisionDir + "/IMG_3285.MOV":                            {Data: []byte(strings.Repeat("b", 200))},
+		collisionDir + "/IMG_3285.MOV.supplemental-metadata.json": {Data: sidecarJSON("IMG_3285.MOV", other)},
+		collisionDir + "/X-edited.jpg":                            {Data: []byte(strings.Repeat("e", 250))}, // no sidecar of its own
+	}}
+	toc, _ := newCollisionTakeoutCmd(t, s1, s2)
+
+	gs := browseGroups(t, toc)
+
+	if got := groupOf(gs, 250); !slices.Equal(got, []int{250, 300}) {
+		t.Errorf("the edit is grouped with %v, want with its original: [250 300]", got)
+	}
+}
+
+// The split is decided on the directory's files before the local duplicates are dropped: here
+// photo A's JPG was already sent with its album copy, and A's HEIC must still not be paired with
+// B, the other photo of the name.
+func TestCompanionOfANamesakeSentEarlierIsNotPairedWithTheOther(t *testing.T) {
+	taken := time.Date(2025, 3, 26, 11, 26, 52, 0, time.UTC)
+	album := "Takeout/Google Photos/Holiday" // sorts before "Photos from 2025"
+	s1 := namedMapFS{name: "takeout-20251016T092000Z-1-001", MapFS: fstest.MapFS{
+		album + "/X.jpg": {Data: []byte(strings.Repeat("a", 100))},
+		album + "/X.jpg.supplemental-metadata.json":         {Data: sidecarJSON("X.jpg", taken)},
+		album + "/metadata.json":                            {Data: []byte(`{"title": "Holiday"}`)},
+		collisionDir + "/X.jpg":                             {Data: []byte(strings.Repeat("a", 100))},
+		collisionDir + "/X.jpg.supplemental-metadata.json":  {Data: sidecarJSON("X.jpg", taken)},
+		collisionDir + "/X.HEIC":                            {Data: []byte(strings.Repeat("h", 150))},
+		collisionDir + "/X.HEIC.supplemental-metadata.json": {Data: sidecarJSON("X.HEIC", taken)},
+	}}
+	s2 := namedMapFS{name: "takeout-20251016T092000Z-2-001", MapFS: fstest.MapFS{
+		collisionDir + "/X.jpg":                            {Data: []byte(strings.Repeat("b", 200))},
+		collisionDir + "/X.jpg.supplemental-metadata.json": {Data: sidecarJSON("X.jpg", taken)},
+	}}
+	toc, _ := newCollisionTakeoutCmd(t, s1, s2)
+
+	gs := browseGroups(t, toc)
+
+	assertNoGroupMixesParts(t, gs)
+}
+
+// A namesake that is a frame of a burst stays in its burst.
+func TestNamesakeFrameStaysInItsBurst(t *testing.T) {
+	taken := time.Date(2025, 3, 26, 11, 26, 52, 0, time.UTC)
+	frame := func(name string, size int) map[string]*fstest.MapFile {
+		return map[string]*fstest.MapFile{
+			collisionDir + "/" + name:                                 {Data: []byte(strings.Repeat("f", size))},
+			collisionDir + "/" + name + ".supplemental-metadata.json": {Data: sidecarJSON(name, taken)},
+		}
+	}
+	s1 := namedMapFS{name: "takeout-20251016T092000Z-1-001", MapFS: fstest.MapFS{}}
+	for i, n := range []string{"IMG_0001.jpg", "IMG_0002.jpg", "IMG_0003.jpg"} {
+		maps.Copy(s1.MapFS, frame(n, 100+i))
+	}
+	s2 := namedMapFS{name: "takeout-20251016T092000Z-2-001", MapFS: fstest.MapFS{
+		collisionDir + "/IMG_0002.jpg":                            {Data: []byte(strings.Repeat("o", 500))}, // another photo
+		collisionDir + "/IMG_0002.jpg.supplemental-metadata.json": {Data: sidecarJSON("IMG_0002.jpg", taken.AddDate(0, 0, 5))},
+	}}
+	toc, _ := newCollisionTakeoutCmd(t, s1, s2)
+	toc.groupers = []groups.Grouper{burst.Group, series.Group} // as with --manage-burst
+
+	gs := browseGroups(t, toc)
+
+	assertNoGroupMixesParts(t, gs)
+	if got := groupOf(gs, 101); !slices.Equal(got, []int{100, 101, 102}) {
+		t.Errorf("the burst's second frame is grouped with %v, want the three frames [100 101 102]", got)
 	}
 }
 
@@ -295,8 +667,12 @@ func TestIdenticalFileInTwoTakeoutsIsALocalDuplicate(t *testing.T) {
 
 	all := browseAll(t, toc)
 
-	if got := len(bySize(all, 100)); got != 1 {
-		t.Errorf("got %d assets for the photo, want 1", got)
+	kept := bySize(all, 100)
+	if len(kept) != 1 {
+		t.Fatalf("got %d assets for the photo, want 1", len(kept))
+	}
+	if kept[0].HasNamesake {
+		t.Error("the photo is marked as having a namesake, but its copy was a duplicate")
 	}
 	if n := rec.GetCounts()[fileevent.DiscardedLocalDuplicate]; n != 1 {
 		t.Errorf("%d local duplicate(s), want 1", n)
